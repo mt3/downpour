@@ -248,6 +248,9 @@ class PoliteFetcher(BaseFetcher):
                 last = next
                 next = self.pldQueue.pop()
                 # Unset the timer
+                if self.timer and self.timer.active():
+                    delta = self.timer.getTime() - now
+                    logger.warn('Call in %fs slipped through the cracks.' % delta)
                 self.timer = None
                 q = qr.Queue(next)
                 
