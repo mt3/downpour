@@ -239,7 +239,9 @@ class PoliteFetcher(BaseFetcher):
                         logger.debug('Waiting %f seconds on %s' % (when - now, next))
                         self.timer = reactor.callLater(when - now, self.serveNext)
                     else:
-                        logger.debug('Leaving active timer alone (%f sec).' % self.timer.getTime()-now)
+                        desired = when - now
+                        actual = self.timer.getTime() - now
+                        logger.debug('Desired wait = %f, actual = %f on %s' % (desired, actual, next))
                     return None
             else:
                 # Go ahead and pop this item
