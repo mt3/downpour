@@ -66,13 +66,13 @@ logger = logging.getLogger('downpour')
 # Stream handler
 formatter = logging.Formatter('[%(asctime)s] %(levelname)s in %(module)s:%(funcName)s@%(lineno)s => %(message)s')
 handler = logging.StreamHandler()
-handler.setLevel(logging.NOTSET)
+handler.setLevel(logging.DEBUG)
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
 # File handler to downpour.log
 handler = handlers.RotatingFileHandler('/var/log/downpour.log', 'a+', maxBytes=100 * 1024 * 1024, backupCount=10)
-handler.setLevel(logging.NOTSET)
+handler.setLevel(logging.DEBUG)
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 

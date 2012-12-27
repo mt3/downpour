@@ -317,7 +317,7 @@ if __name__ == '__main__':
     from downpour import BaseRequest
     
     # Turn on logging
-    logger.setLevel(logging.NOTSET)
+    logger.setLevel(logging.DEBUG)
 
     q = qr.Queue('requests')
     with file('urls.txt') as f:
