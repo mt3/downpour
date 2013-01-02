@@ -71,18 +71,41 @@ class Counter(object):
         # logger.debug('Len %s; Removed: %d; zcard = %d' % (key, removed, card))
         return card
 
+# XXX - This is unacceptably chummy with the underlying implementation,
+# but it is both simple and efficient.
+class PLDQueue(qr.PriorityQueue):
+    # Only push if not already there. Like all qr functions, not atomic.
+    def push_unique(self, value, score):
+        if self.redis.zscore(self.key, self._pack(value)) is None:
+            self.push(value, score)
+
 class PoliteFetcher(BaseFetcher):
     # This is the maximum number of parallel requests we can make 
     # to the same key
     maxParallelRequests = 5
     
     def __init__(self, poolSize=10, agent=None, stopWhenDone=False, 
-        delay=2, allowAll=False, **kwargs):
+        delay=2, allowAll=False, use_lock=None, **kwargs):
         
-        # Call the parent constructor
+        # First, call the parent constructor
         BaseFetcher.__init__(self, poolSize, agent, stopWhenDone)
+        
+        # Import DownpourLock only if use_lock specified, because it uses
+        # *NIX-specific features. We use one lock for the pldQueue and one
+        # for all the request queues collectively. The latter is a tad
+        # overly restrictive, but is far easier than managing hundreds
+        # of locks for hundreds of queues.
+        if use_lock:
+            import DownpourLock
+            self.pld_lock =  = DownpourLock.DownpourLock("%s_pld.lock" % use_lock)
+            self.req_lock = DownpourLock.DownpourLock("%s_req.lock" % use_lock)
+        else:
+            self.pld_lock  = threading.RLock()
+            self.req_lock = threading.RLock()
+        self.twi_lock = threading.RLock()  # Twisted reactor lock
+    
         # Include a priority queue of plds
-        self.pldQueue = qr.PriorityQueue('plds', **kwargs)
+        self.pldQueue = PLDQueue('plds', **kwargs)
         # Make sure that there is an entry in the plds for
         # each domain waiting to be fetched. Also, include
         # the number of urls from each domain in the count
@@ -96,7 +119,8 @@ class PoliteFetcher(BaseFetcher):
         # of the lengths of each of the domain queues.
         with self.r.pipeline() as p:
             for key in self.r.keys('domain:*'):
-                self.pldQueue.push(key, 0)
+                with self.pld_lock:
+                    self.pldQueue.push_unique(key, 0)
                 p.llen(key)
             self.remaining = sum(p.execute())
         # For whatever reason, pushing key names back into the 
@@ -114,18 +138,7 @@ class PoliteFetcher(BaseFetcher):
         # For example, if you're checking for allow in other places
         self.allowAll = allowAll
         self.userAgentString = reppy.getUserAgentString(self.agent)
-        self.lock  = threading.RLock()
-        self.tlock = threading.RLock()
         
-        # This needs to actually be kept in Redis, since we anticipate
-        # running more than one process at any one time.
-        #   This used to be self.flights
-        # When we first start fetching, we
-        # Something we have to take into account is resetting this when
-        # we exit. If this gets out of whack, then we could get crawls
-        # stalled.
-        # To 
-    
     def __len__(self):
         ''''''
         return len(self.pldQueue) + len(self.requests)
@@ -173,14 +186,18 @@ class PoliteFetcher(BaseFetcher):
         #   request, since subsequent requests will like depend on
         #   it.
         # self.pldQueue.push(request._originalKey, time.time() + self.crawlDelay(request))
-        with self.lock:
+        # Multiple pldQueue entries for a single domain play hob with the
+        # logic for managing crawl delays, and Dan says that the queue
+        # should only contain one entry per domain, so use push_unique
+        # here.
+        with self.pld_lock:
             if isinstance(request, RobotsRequest):
-                self.pldQueue.push(request._originalKey, time.time() + self.crawlDelay(request))
+                self.pldQueue.push_unique(request._originalKey, time.time() + self.crawlDelay(request))
             # If this request would bring down our parallel requests 
             # down from the maximum, then we should immediately requeue
             # the original key to reduce latency.
             if Counter.remove(self.r, request) == (self.maxParallelRequests - 1):
-                self.pldQueue.push(request._originalKey, time.time() + self.crawlDelay(request))
+                self.pldQueue.push_unique(request._originalKey, time.time() + self.crawlDelay(request))
     
     # When we try to pop off an empty queue
     def onEmptyQueue(self, key):
@@ -203,112 +220,126 @@ class PoliteFetcher(BaseFetcher):
     def grow(self, upto=10000):
         count = 0
         t = time.time()
-        r = self.requests.pop()
+        with self.req_lock:
+            r = self.requests.pop()
         while r and count < upto:
             count += self.push(r) or 0
-            r = self.requests.pop()
+            with self.req_lock:
+                r = self.requests.pop()
         logger.debug('Grew by %i' % count)
         return BaseFetcher.grew(self, count)
     
     def trim(self, request, trim):
         # Then, trim that list
-        qr.Queue(self.getKey(request)).trim(trim)
+        with self.req_lock:
+            qr.Queue(self.getKey(request)).trim(trim)
     
+    # This is one of two places where we use pld_lock inside of a req_lock.
     def push(self, request):
         key = self.getKey(request)
         q = qr.Queue(key)
-        if not len(q):
-            self.pldQueue.push(key, time.time())
-        q.push(request)
+        with self.req_lock:
+            if not len(q):
+                with self.pld_lock:
+                    self.pldQueue.push_unique(key, time.time())
+            q.push(request)
         self.remaining += 1
         return 1
     
+    # Here we use twi_lock inside pld_lock, and pld_lock inside req_lock.
+    # Don't use locks-in-locks in the reverse order anywhere, or downpour
+    # might deadlock.
     def pop(self, polite=True):
         '''Get the next request'''
         now = time.time()
         while True:
-            # Get the next plds we might want to fetch from
-            next, when = self.pldQueue.peek(withscores=True)
-            if not next:
-                logger.debug('Nothing in pldQueue.')
-                return None
-            # If the next-fetchable is not soon enough, then wait
-            if polite and when > now:
-                with self.tlock:
-                    if not (self.timer and self.timer.active()):
+            
+            # First, we pop the next thing in pldQueue *if* it's not a
+            # premature fetch (and a race condition is not detected).
+            with self.pld_lock:
+                # Get the next plds we might want to fetch from
+                next, when = self.pldQueue.peek(withscores=True)
+                if not next:
+                    logger.debug('Nothing in pldQueue.')
+                    return None
+                with self.twi_lock:
+                    # XXX - Be paranoid and defend against race conditions:
+                    # If there is already something scheduled in self.timer,
+                    # complain and exit.
+                    if self.timer and self.timer.active():
+                        delta = self.timer.getTime() - now
+                        logger.error('%s will run in %fs, goodbye!' % (next, delta))
+                        return None
+                    # If this is a premature fetch, kick the can down the road.
+                    if polite and when > now:
                         logger.debug('Waiting %f seconds on %s' % (when - now, next))
                         self.timer = reactor.callLater(when - now, self.serveNext)
-                    else:
-                        desired = when - now
-                        actual = self.timer.getTime() - now
-                        logger.debug('Desired wait = %f, actual = %f on %s' % (desired, actual, next))
-                    return None
-            else:
-                # Go ahead and pop this item
-                last = next
+                        return None
+                    # If neither, clear any old cruft in self.timer
+                    self.timer = None
                 next = self.pldQueue.pop()
-                # Unset the timer
-                if self.timer and self.timer.active():
-                    delta = self.timer.getTime() - now
-                    logger.warn('Call in %fs slipped through the cracks.' % delta)
-                self.timer = None
-                q = qr.Queue(next)
-                
-                with self.lock:
-                    if len(q):
-                        # If we've already saturated our parallel requests, then we'll
-                        # wait some short amount of time before we make our next request.
-                        # There is logic elsewhere so that if one of these requests 
-                        # completes before this small amount of time elapses, then it
-                        # will be advanced accordingly.
-                        if Counter.len(self.r, next) >= self.maxParallelRequests:
-                            self.pldQueue.push(next, time.time() + 20)
-                            continue
-                        
-                        # If the robots for this particular request is not fetched
-                        # or it's expired, then we'll have to make a request for it
-                        v = q.peek()
-                        domain = urlparse.urlparse(v.url).netloc
-                        robot = reppy.findRobot('http://' + domain)
-                        if not self.allowAll and (not robot or robot.expired):
-                            logger.debug('Making robots request for %s' % next)
-                            r = RobotsRequest('http://' + domain + '/robots.txt')
-                            r._originalKey = next
-                            # Increment the number of requests we currently have in flight
-                            Counter.put(self.r, r)
-                            return r
-                        else:
-                            logger.debug('Popping next request from %s' % next)
-                            v = q.pop()
-                            # This was the source of a rather difficult-to-track bug
-                            # wherein the pld queue would slowly drain, despite there
-                            # being plenty of logical queues to draw from. The problem
-                            # was introduced by calling urlparse.urljoin when invoking
-                            # the request's onURL method. As a result, certain redirects
-                            # were making changes to the url, saving it as an updated
-                            # value, but we'd then try to pop off the queue for the new
-                            # hostname, when in reality, we should pop off the queue 
-                            # for the original hostname.
-                            v._originalKey = next
-                            # Increment the number of requests we currently have in flight
-                            Counter.put(self.r, v)
-                            # At this point, we should also schedule the next request
-                            # to this domain.
-                            self.pldQueue.push(next, time.time() + self.crawlDelay(v))
-                            return v
-                    else:
-                        try:
-                            if Counter.len(self.r, next) == 0:
-                                logger.debug('Calling onEmptyQueue for %s' % next)
-                                self.onEmptyQueue(next)
-                            else:
-                                # Otherwise, we should try again in a little bit, and 
-                                # see if the last request has finished.
-                                self.pldQueue.push(next, time.time() + 20)
-                                logger.debug('Requests still in flight for %s. Waiting' % next)
-                        except Exception:
-                            logger.exception('onEmptyQueue failed for %s' % next)
+            
+            # We're good. Get the queue pertaining to the PLD of interest
+            # and acquire a request lock for it.
+            q = qr.Queue(next)
+            with self.req_lock:
+                if len(q):
+                    # If we've already saturated our parallel requests, then we'll
+                    # wait some short amount of time before we make our next request.
+                    # There is logic elsewhere so that if one of these requests 
+                    # completes before this small amount of time elapses, then it
+                    # will be advanced accordingly.
+                    if Counter.len(self.r, next) >= self.maxParallelRequests:
+                        with self.pld_lock:
+                            self.pldQueue.push_unique(next, time.time() + 20)
                         continue
+                    # If the robots for this particular request is not fetched
+                    # or it's expired, then we'll have to make a request for it
+                    v = q.peek()
+                    domain = urlparse.urlparse(v.url).netloc
+                    robot = reppy.findRobot('http://' + domain)
+                    if not self.allowAll and (not robot or robot.expired):
+                        logger.debug('Making robots request for %s' % next)
+                        r = RobotsRequest('http://' + domain + '/robots.txt')
+                        r._originalKey = next
+                        # Increment the number of requests we currently have in flight
+                        Counter.put(self.r, r)
+                        return r
+                    else:
+                        logger.debug('Popping next request from %s' % next)
+                        v = q.pop()
+                        # This was the source of a rather difficult-to-track bug
+                        # wherein the pld queue would slowly drain, despite there
+                        # being plenty of logical queues to draw from. The problem
+                        # was introduced by calling urlparse.urljoin when invoking
+                        # the request's onURL method. As a result, certain redirects
+                        # were making changes to the url, saving it as an updated
+                        # value, but we'd then try to pop off the queue for the new
+                        # hostname, when in reality, we should pop off the queue 
+                        # for the original hostname.
+                        v._originalKey = next
+                        # Increment the number of requests we currently have in flight
+                        Counter.put(self.r, v)
+                        # At this point, we should also schedule the next request
+                        # to this domain.
+                        with self.pld_lock:
+                            self.pldQueue.push_unique(next, time.time() + self.crawlDelay(v))
+                        return v
+                else:
+                    try:
+                        if Counter.len(self.r, next) == 0:
+                            logger.debug('Calling onEmptyQueue for %s' % next)
+                            self.onEmptyQueue(next)
+                        else:
+                            # Otherwise, we should try again in a little bit, and 
+                            # see if the last request has finished.
+                            with self.pld_lock:
+                                self.pldQueue.push_unique(next, time.time() + 20)
+                            logger.debug('Requests still in flight for %s. Waiting' % next)
+                    except Exception:
+                        logger.exception('onEmptyQueue failed for %s' % next)
+                    continue
+                
         logger.debug('Returning None (should not happen).')
         return None
         
