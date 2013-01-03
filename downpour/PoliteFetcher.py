@@ -99,10 +99,10 @@ class PLDQueue(qr.PriorityQueue):
     # Pop, replacing with a placeholder. Never return a placeholder to
     # the caller (return None instead).
     def pop(self, withscores=False):
-        v, s = self.peek(self, withscores=True)
+        v, s = self.peek(withscores=True)
         if v is None:
             return (None, 0.0) if withscores else None
-        self.push(self, v, sys.float_info.max)
+        self.push(v, sys.float_info.max)
         return (v, s) if withscores else v
 
     # Nuke a placeholder. Take offense if a non-placeholder is there.
