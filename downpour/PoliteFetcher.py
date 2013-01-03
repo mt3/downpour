@@ -78,10 +78,15 @@ class Counter(object):
 # never overwrite non-placeholders already in the queue. Like all qr
 # queues, no operation here is guaranteed to be atomic.
 class PLDQueue(qr.PriorityQueue):
+    # Yuck. Writing a float to Redis and reading it back sometimes leads
+    # to lossage. Proclaim anything sufficiently huge as a placeholder.
+    _PH = sys.float_info.max
+    _PH_MIN = 10.0 ** sys.float_info.max_10_exp # very lenient!
+
     # Only push if not already there or is a placeholder.
     def push_unique(self, value, score):
         v = self.redis.zscore(self.key, self._pack(value))
-        if v is None or v == sys.float_info.max:
+        if v is None or v >= self._PH_MIN:
             self.push(value, score)
 
     # As above, but leave placeholders alone, too.
@@ -92,7 +97,7 @@ class PLDQueue(qr.PriorityQueue):
     # Just look, don't touch. Hide placeholders.
     def peek(self, withscores=False):
         v, s = qr.PriorityQueue.peek(self, withscores=True)
-        if v is None or s == sys.float_info.max:
+        if v is None or s >= self._PH_MIN:
             return (None, 0.0) if withscores else None
         return (v, s) if withscores else v
 
@@ -102,7 +107,7 @@ class PLDQueue(qr.PriorityQueue):
         v, s = self.peek(withscores=True)
         if v is None:
             return (None, 0.0) if withscores else None
-        self.push(v, sys.float_info.max)
+        self.push(v, self._PH)
         return (v, s) if withscores else v
 
     # Nuke a placeholder. Take offense if a non-placeholder is there.
@@ -111,7 +116,7 @@ class PLDQueue(qr.PriorityQueue):
         v = self.redis.zscore(self.key, packed)
         if v is None:
             return
-        if v != sys.float_info.max:
+        if v < self._PH_MIN:
             raise ValueError('Attempt to clear an active PLD.')
         self.redis.zrem(self.key, packed)
 
