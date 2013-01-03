@@ -26,6 +26,7 @@
 from downpour import BaseFetcher, RobotsRequest, logger, reactor
 
 import qr
+import sys
 import time
 import reppy
 import redis
@@ -72,12 +73,46 @@ class Counter(object):
         return card
 
 # XXX - This is unacceptably chummy with the underlying implementation,
-# but it is both simple and efficient.
+# but it is efficient. Always keep *something* in the underlying Redis
+# set, possibly a placeholder, while a PLD is being worked on. Moreover,
+# never overwrite non-placeholders already in the queue. Like all qr
+# queues, no operation here is guaranteed to be atomic.
 class PLDQueue(qr.PriorityQueue):
-    # Only push if not already there. Like all qr functions, not atomic.
+    # Only push if not already there or is a placeholder.
     def push_unique(self, value, score):
+        v = self.redis.zscore(self.key, self._pack(value))
+        if v is None or v == sys.float_info.max:
+            self.push(value, score)
+
+    # As above, but leave placeholders alone, too.
+    def push_init(self, value, score):
         if self.redis.zscore(self.key, self._pack(value)) is None:
             self.push(value, score)
+
+    # Just look, don't touch. Hide placeholders.
+    def peek(self, withscores=False):
+        v, s = qr.PriorityQueue.peek(self, withscores=True)
+        if v is None or s == sys.float_info.max:
+            return (None, 0.0) if withscores else None
+        return (v, s) if withscores else v
+
+    # Pop, replacing with a placeholder. Never return a placeholder to
+    # the caller (return None instead).
+    def pop(self, withscores=False):
+        v, s = qr.PriorityQueue.peek(self, withscores=True)
+        if v is None or s == sys.float_info.max:
+            return (None, 0.0) if withscores else None
+        return qr.PriorityQueue.pop(self, withscores=withscores)
+
+    # Nuke a placeholder. Take offense if a non-placeholder is there.
+    def clear_ph(self, value):
+        packed = self._pack(value)
+        v = self.redis.zscore(self.key, packed)
+        if v is None:
+            return
+        if v != sys.float_info.max:
+            raise ValueError('Attempt to clear an active PLD.')
+        self.redis.zrem(self.key, packed)
 
 class PoliteFetcher(BaseFetcher):
     # This is the maximum number of parallel requests we can make
@@ -120,7 +155,7 @@ class PoliteFetcher(BaseFetcher):
         with self.r.pipeline() as p:
             for key in self.r.keys('domain:*'):
                 with self.pld_lock:
-                    self.pldQueue.push_unique(key, 0)
+                    self.pldQueue.push_init(key, 0)
                 p.llen(key)
             self.remaining = sum(p.execute())
         # For whatever reason, pushing key names back into the
@@ -241,7 +276,7 @@ class PoliteFetcher(BaseFetcher):
         with self.req_lock:
             if not len(q):
                 with self.pld_lock:
-                    self.pldQueue.push_unique(key, time.time())
+                    self.pldQueue.push_init(key, time.time())
             q.push(request)
         self.remaining += 1
         return 1
@@ -330,6 +365,10 @@ class PoliteFetcher(BaseFetcher):
                         if Counter.len(self.r, next) == 0:
                             logger.debug('Calling onEmptyQueue for %s' % next)
                             self.onEmptyQueue(next)
+                            try:
+                                self.pldQueue.clear_ph(next)
+                            except ValueError:
+                                logger.error('pldQueue.clear_ph failed for %s' % next)
                         else:
                             # Otherwise, we should try again in a little bit, and
                             # see if the last request has finished.
