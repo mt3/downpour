@@ -132,7 +132,7 @@ class PoliteFetcher(BaseFetcher):
         # of locks for hundreds of queues.
         if use_lock:
             import DownpourLock
-            self.pld_lock =  = DownpourLock.DownpourLock("%s_pld.lock" % use_lock)
+            self.pld_lock = DownpourLock.DownpourLock("%s_pld.lock" % use_lock)
             self.req_lock = DownpourLock.DownpourLock("%s_req.lock" % use_lock)
         else:
             self.pld_lock  = threading.RLock()
