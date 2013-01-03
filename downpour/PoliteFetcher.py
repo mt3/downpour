@@ -102,7 +102,8 @@ class PLDQueue(qr.PriorityQueue):
         v, s = qr.PriorityQueue.peek(self, withscores=True)
         if v is None or s == sys.float_info.max:
             return (None, 0.0) if withscores else None
-        return qr.PriorityQueue.pop(self, withscores=withscores)
+        qr.PriorityQueue.push(self, v, sys.float_info.max)
+        return (v, s) if withscores else v
 
     # Nuke a placeholder. Take offense if a non-placeholder is there.
     def clear_ph(self, value):
