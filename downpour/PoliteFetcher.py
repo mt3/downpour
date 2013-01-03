@@ -366,7 +366,8 @@ class PoliteFetcher(BaseFetcher):
                             logger.debug('Calling onEmptyQueue for %s' % next)
                             self.onEmptyQueue(next)
                             try:
-                                self.pldQueue.clear_ph(next)
+                                with self.pld_lock:
+                                    self.pldQueue.clear_ph(next)
                             except ValueError:
                                 logger.error('pldQueue.clear_ph failed for %s' % next)
                         else:
