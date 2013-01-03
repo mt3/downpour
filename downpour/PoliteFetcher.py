@@ -301,15 +301,15 @@ class PoliteFetcher(BaseFetcher):
                 # Get the next plds we might want to fetch from
                 next, when = self.pldQueue.peek(withscores=True)
                 if not next:
-                    logger.debug('Nothing in pldQueue.')
+                    # logger.debug('Nothing in pldQueue.')
                     return None
                 with self.twi_lock:
                     # XXX - Be paranoid and defend against race conditions:
                     # If there is already something scheduled in self.timer,
                     # complain and exit.
                     if self.timer and self.timer.active():
-                        delta = self.timer.getTime() - now
-                        logger.error('%s will run in %fs, goodbye!' % (next, delta))
+                        # delta = self.timer.getTime() - now
+                        # logger.error('%s will run in %fs, goodbye!' % (next, delta))
                         return None
                     # If this is a premature fetch, kick the can down the road.
                     if polite and when > now:
