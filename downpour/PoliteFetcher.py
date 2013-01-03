@@ -81,7 +81,7 @@ class PLDQueue(qr.PriorityQueue):
     # Yuck. Writing a float to Redis and reading it back sometimes leads
     # to lossage. Proclaim anything sufficiently huge as a placeholder.
     _PH = sys.float_info.max
-    _PH_MIN = 10.0 ** sys.float_info.max_10_exp # very lenient!
+    _PH_MIN = sys.float_info.max * 0.99 # very lenient!
 
     # Only push if not already there or is a placeholder.
     def push_unique(self, value, score):
@@ -174,7 +174,8 @@ class PoliteFetcher(BaseFetcher):
         self.delay = float(delay)
         # This is used when we have to impose a delay before
         # servicing the next available request.
-        self.timer = None
+        with self.twi_lock:
+            self.timer = None
         # This is a way to ignore the allow/disallow directives
         # For example, if you're checking for allow in other places
         self.allowAll = allowAll
@@ -303,25 +304,26 @@ class PoliteFetcher(BaseFetcher):
                 if not next:
                     # logger.debug('Nothing in pldQueue.')
                     return None
+                # If the next-fetchable is not soon enough, then wait. If
+                # we're already waiting, don't schedule a double callLater.
+                if polite and when > now:
+                    with self.twi_lock:
+                        if not (self.timer and self.timer.active()):
+                            logger.debug('Waiting %f seconds on %s' % (when - now, next))
+                            self.timer = reactor.callLater(when - now, self.serveNext)
+                    return None
+                # If we get here, we don't need to wait. However, the
+                # multithreaded nature of Twisted means that something
+                # else might be waiting. Only clear timer if it's not
+                # holding some other pending call.
                 with self.twi_lock:
-                    # XXX - Be paranoid and defend against race conditions:
-                    # If there is already something scheduled in self.timer,
-                    # complain and exit.
-                    if self.timer and self.timer.active():
-                        # delta = self.timer.getTime() - now
-                        # logger.error('%s will run in %fs, goodbye!' % (next, delta))
-                        return None
-                    # If this is a premature fetch, kick the can down the road.
-                    if polite and when > now:
-                        logger.debug('Waiting %f seconds on %s' % (when - now, next))
-                        self.timer = reactor.callLater(when - now, self.serveNext)
-                        return None
-                    # If neither, clear any old cruft in self.timer
-                    self.timer = None
+                    if not (self.timer and self.timer.active()):
+                        self.timer = None
+                # We know the time has passed (we peeked) so pop it.
                 next = self.pldQueue.pop()
 
-            # We're good. Get the queue pertaining to the PLD of interest
-            # and acquire a request lock for it.
+            # Get the queue pertaining to the PLD of interest and
+            # acquire a request lock for it.
             q = qr.Queue(next)
             with self.req_lock:
                 if len(q):
