@@ -293,7 +293,6 @@ class PoliteFetcher(BaseFetcher):
     # might deadlock.
     def pop(self, polite=True):
         '''Get the next request'''
-        now = time.time()
         while True:
 
             # First, we pop the next thing in pldQueue *if* it's not a
@@ -306,6 +305,7 @@ class PoliteFetcher(BaseFetcher):
                     return None
                 # If the next-fetchable is not soon enough, then wait. If
                 # we're already waiting, don't schedule a double callLater.
+                now = time.time()
                 if polite and when > now:
                     with self.twi_lock:
                         if not (self.timer and self.timer.active()):
