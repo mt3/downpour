@@ -293,7 +293,6 @@ class PoliteFetcher(BaseFetcher):
     # might deadlock.
     def pop(self, polite=True):
         '''Get the next request'''
-        now = time.time()
         while True:
 
             # First, we pop the next thing in pldQueue *if* it's not a
@@ -306,11 +305,11 @@ class PoliteFetcher(BaseFetcher):
                     return None
                 # If the next-fetchable is not soon enough, then wait. If
                 # we're already waiting, don't schedule a double callLater.
-                if polite and when > now:
-                    with self.twi_lock:
-                        if not (self.timer and self.timer.active()):
-                            logger.debug('Waiting %f seconds on %s' % (when - now, next))
-                            self.timer = reactor.callLater(when - now, self.serveNext)
+                with self.twi_lock:
+                    now = time.time()
+                    if polite and when > now and not (self.timer and self.timer.active()):
+                        logger.debug('Waiting %f seconds on %s' % (when - now, next))
+                        self.timer = reactor.callLater(when - now, self.serveNext)
                     return None
                 # If we get here, we don't need to wait. However, the
                 # multithreaded nature of Twisted means that something
