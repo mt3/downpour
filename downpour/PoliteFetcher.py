@@ -333,6 +333,7 @@ class PoliteFetcher(BaseFetcher):
                     # completes before this small amount of time elapses, then it
                     # will be advanced accordingly.
                     if Counter.len(self.r, next) >= self.maxParallelRequests:
+                        logger.debug('maxParallelRequests exceeded for %s' % next)
                         with self.pld_lock:
                             self.pldQueue.push_unique(next, time.time() + 20)
                         continue
